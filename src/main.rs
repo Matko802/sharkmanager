@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::{
     gdk, gio, glib, graphene, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea,
     Entry, FlowBox, FlowBoxChild, GestureClick, GestureDrag, HeaderBar, Label, ListBox, ListBoxRow,
-    Notebook, Orientation, Overlay, Paned, PopoverMenu, ScrolledWindow, SearchEntry, Separator,
+    Orientation, Overlay, Paned, PopoverMenu, ScrolledWindow, SearchEntry, Separator,
     Stack, ToggleButton,
 };
 use std::cell::{Cell, RefCell};
@@ -83,7 +83,7 @@ impl AppState {
 }
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = adw::Application::new(Some(APP_ID), Default::default());
     app.connect_startup(|_| {
         // CSS
         let provider = gtk::CssProvider::new();
@@ -183,45 +183,9 @@ fn main() -> glib::ExitCode {
                 border-top: 1px solid alpha(@borders, 0.5);
             }
 
-            /* ===== Floating tabs (Thunar-style) ===== */
-            notebook.shark-tabs { background: transparent; }
-            notebook.shark-tabs > header {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                padding: 7px 10px 2px 10px;
-            }
-            notebook.shark-tabs > header > tabs { margin: 0; }
-            notebook.shark-tabs > header > tabs > tab {
-                min-width: 110px;
-                min-height: 30px;
-                padding: 2px 9px;
-                margin: 2px 3px 4px 3px;
-                border-radius: 8px;
-                border: 1px solid transparent;
-                background: transparent;
-                color: alpha(@view_fg_color, 0.75);
-                transition: background-color 120ms ease,
-                            border-color 120ms ease;
-            }
-            notebook.shark-tabs > header > tabs > tab:hover {
-                background: alpha(@view_fg_color, 0.07);
-            }
-            notebook.shark-tabs > header > tabs > tab:selected {
-                background: alpha(@view_fg_color, 0.15);
-                border-color: alpha(@view_fg_color, 0.25);
-                color: @view_fg_color;
-            }
-            notebook.shark-tabs > header > tabs > tab:selected .shark-tab-label {
-                font-weight: 700;
-            }
-            notebook.shark-tabs > header > tabs > tab .shark-tab-label {
-                padding: 0 2px;
-            }
-            notebook.shark-tabs > header > tabs > tab button {
-                min-width: 20px;
-                min-height: 20px;
-                padding: 0;
+            /* ===== Breadcrumb bar under the header ===== */
+            .shark-crumbbar {
+                border-bottom: 1px solid alpha(@borders, 0.5);
             }
 
             headerbar { padding: 2px; }
@@ -234,7 +198,7 @@ fn main() -> glib::ExitCode {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     });
-    app.connect_activate(build_ui);
+    app.connect_activate(|app| build_ui(app.upcast_ref()));
     app.run()
 }
 
@@ -296,9 +260,11 @@ fn build_ui(app: &Application) {
     header.pack_start(&btn_refresh);
     header.pack_end(&search_entry);
 
-    // Title widget — breadcrumbs container + editable path
+    // Breadcrumb bar lives under the header now; the header center
+    // holds Nautilus-style tabs instead.
     let breadcrumb_box = GtkBox::new(Orientation::Horizontal, 2);
     breadcrumb_box.add_css_class("shark-breadcrumb");
+    breadcrumb_box.set_hexpand(true);
 
     let path_entry = Entry::builder()
         .placeholder_text("Enter path…")
@@ -306,14 +272,20 @@ fn build_ui(app: &Application) {
         .hexpand(true)
         .build();
 
-    let title_box = GtkBox::new(Orientation::Horizontal, 0);
-    title_box.set_hexpand(true);
-    title_box.set_halign(gtk::Align::Fill);
-    title_box.append(&breadcrumb_box);
-    title_box.append(&path_entry);
-
-    // Use custom title widget (centered). We set title widget to breadcrumb area.
-    header.set_title_widget(Some(&title_box));
+    // Title widget — Nautilus-style tabs in the header.
+    let tabview = adw::TabView::new();
+    let tab_bar = adw::TabBar::new();
+    tab_bar.set_view(Some(&tabview));
+    let btn_add_tab = Button::from_icon_name("list-add-symbolic");
+    btn_add_tab.add_css_class("flat");
+    btn_add_tab.set_tooltip_text(Some("New tab (Ctrl+T)"));
+    let tab_box = GtkBox::new(Orientation::Horizontal, 0);
+    tab_box.set_hexpand(true);
+    tab_box.set_halign(gtk::Align::Fill);
+    tab_bar.set_hexpand(true);
+    tab_box.append(&tab_bar);
+    tab_box.append(&btn_add_tab);
+    header.set_title_widget(Some(&tab_box));
 
     window.set_titlebar(Some(&header));
 
@@ -336,13 +308,6 @@ fn build_ui(app: &Application) {
         window.set_data("sidebar", sidebar.clone());
     }
 
-    // Tabs: one pane (state + views) per page, plus a trailing "+" page.
-    let notebook = gtk::Notebook::new();
-    notebook.set_show_tabs(true);
-    notebook.set_scrollable(true);
-    notebook.set_show_border(false);
-    notebook.add_css_class("shark-tabs");
-
     let active_pane: Rc<RefCell<Option<Rc<Pane>>>> = Rc::new(RefCell::new(None));
 
     let shared = Shared {
@@ -356,36 +321,43 @@ fn build_ui(app: &Application) {
         btn_hidden: btn_hidden.clone(),
     };
 
+    let crumb_bar = GtkBox::new(Orientation::Horizontal, 6);
+    crumb_bar.add_css_class("shark-crumbbar");
+    crumb_bar.set_margin_start(8);
+    crumb_bar.set_margin_end(8);
+    crumb_bar.set_margin_top(4);
+    crumb_bar.set_margin_bottom(4);
+    crumb_bar.append(&breadcrumb_box);
+    crumb_bar.append(&path_entry);
+
     paned.set_start_child(Some(&sidebar_scroll));
-    paned.set_end_child(Some(&notebook));
+    paned.set_end_child(Some(&tabview));
     paned.set_position(220);
+    paned.set_vexpand(true);
 
-    window.set_child(Some(&paned));
+    let content = GtkBox::new(Orientation::Vertical, 0);
+    content.append(&crumb_bar);
+    content.append(&paned);
+    window.set_child(Some(&content));
 
-    // Trailing "+" tab: selecting it opens a new tab.
-    let plus_btn = Button::from_icon_name("list-add-symbolic");
-    plus_btn.add_css_class("flat");
-    plus_btn.set_tooltip_text(Some("New tab (Ctrl+T)"));
-    let plus_page = GtkBox::new(Orientation::Horizontal, 0);
-    plus_page.set_hexpand(true);
-    plus_page.set_vexpand(true);
-    unsafe {
-        plus_page.set_data("plus", ());
+    {
+        let ap = active_pane.clone();
+        let shared = shared.clone();
+        let tv = tabview.clone();
+        btn_add_tab.connect_clicked(move |_| {
+            open_new_tab(&shared, &tv, &ap);
+        });
     }
-    notebook.append_page(&plus_page, Some(&plus_btn));
 
-    // Tab switch: activate the pane behind the selected page; "+" adds a tab.
+    // Tab switch: activate the pane behind the selected page.
     {
         let active_pane = active_pane.clone();
         let shared = shared.clone();
-        notebook.connect_switch_page(move |nb, page, _idx| {
-            let is_plus = unsafe { page.data::<()>("plus").is_some() };
-            if is_plus {
-                open_new_tab(&shared, nb, &active_pane);
-                return;
-            }
+        tabview.connect_selected_page_notify(move |tv| {
+            let Some(page) = tv.selected_page() else { return };
+            let child = page.child();
             unsafe {
-                if let Some(p) = page.data::<Rc<Pane>>("pane") {
+                if let Some(p) = child.data::<Rc<Pane>>("pane") {
                     *active_pane.borrow_mut() = Some(p.as_ref().clone());
                     sync_controls(&shared, p.as_ref());
                     p.as_ref().refresh_fn()();
@@ -394,9 +366,20 @@ fn build_ui(app: &Application) {
         });
     }
 
-    let first_pane = build_pane(shared.clone(), initial, &notebook, &active_pane);
+    // Tab × button: close the page, or the window when it's the last one.
+    {
+        let win = window.clone();
+        tabview.connect_close_page(move |tv, _page| {
+            if tv.n_pages() <= 1 {
+                win.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    let first_pane = build_pane(shared.clone(), initial, &tabview);
     *active_pane.borrow_mut() = Some(first_pane.clone());
-    notebook.set_current_page(Some(0));
     first_pane.refresh_fn()();
 
     // per-pane views, refresh, gestures and context menus are built in
@@ -653,7 +636,7 @@ fn build_ui(app: &Application) {
     {
         let ap = active_pane.clone();
         let shared_k = shared.clone();
-        let notebook_k = notebook.clone();
+        let tabview_k = tabview.clone();
         let key = gtk::EventControllerKey::new();
         key.connect_key_pressed(move |_, key, _, mods| {
             let Some(pane) = ap.borrow().as_ref().cloned() else {
@@ -741,17 +724,11 @@ fn build_ui(app: &Application) {
                         return glib::Propagation::Stop;
                     },
                     gdk::Key::t => {
-                        open_new_tab(&shared_k, &notebook_k, &ap);
+                        open_new_tab(&shared_k, &tabview_k, &ap);
                         return glib::Propagation::Stop;
                     },
                     gdk::Key::w => {
-                        let pane2 = pane.clone();
-                        close_tab(
-                            &shared_k.window,
-                            &notebook_k,
-                            &ap,
-                            &pane2.page.clone().upcast::<gtk::Widget>(),
-                        );
+                        close_selected_tab(&shared_k.window, &tabview_k);
                         return glib::Propagation::Stop;
                     },
                     _ => {}
@@ -823,9 +800,8 @@ struct Pane {
     status_sel: Label,
     status_count: Label,
     status_label: Label,
-    page: GtkBox,
-    tab_label: Label,
-    refresh: RefreshCell,
+    adw_page: adw::TabPage,
+    refresh: Rc<RefCell<Option<RefreshFn>>>,
 }
 
 impl Pane {
@@ -850,55 +826,39 @@ fn sync_controls(shared: &Shared, pane: &Pane) {
         .set_active(pane.state.view_mode.get() == ViewMode::List);
 }
 
-/// Open a new tab. Starts in the current pane's directory (or $HOME).
-fn open_new_tab(shared: &Shared, notebook: &Notebook, active_pane: &Rc<RefCell<Option<Rc<Pane>>>>) {
+/// Open a new tab after the selected one (Nautilus behaviour).
+fn open_new_tab(
+    shared: &Shared,
+    tabview: &adw::TabView,
+    active_pane: &Rc<RefCell<Option<Rc<Pane>>>>,
+) {
     let start = active_pane
         .borrow()
         .as_ref()
         .map(|p| p.state.current_path.borrow().clone())
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/"));
-    build_pane(shared.clone(), start, notebook, active_pane);
-    let idx = notebook.n_pages().saturating_sub(2);
-    notebook.set_current_page(Some(idx));
+    build_pane(shared.clone(), start, tabview);
 }
 
-/// Close the tab whose view widget is `page`. The window closes when the last
-/// tab is closed (the trailing "+" page is not a tab, so <=2 pages = 1 tab).
-fn close_tab(
-    window: &ApplicationWindow,
-    notebook: &Notebook,
-    active_pane: &Rc<RefCell<Option<Rc<Pane>>>>,
-    page: &gtk::Widget,
-) {
-    if notebook.n_pages() <= 2 {
+/// Close the selected tab; closing the last one closes the window.
+fn close_selected_tab(window: &ApplicationWindow, tabview: &adw::TabView) {
+    let Some(page) = tabview.selected_page() else {
+        return;
+    };
+    if tabview.n_pages() <= 1 {
         window.close();
-        return;
-    }
-    let Some(idx) = notebook.page_num(page) else {
-        return;
-    };
-    let was_active = {
-        let ap = active_pane.borrow();
-        let pane = unsafe { page.data::<Rc<Pane>>("pane").map(|p| p.as_ref().clone()) };
-        pane.as_ref()
-            .zip(ap.as_ref())
-            .is_some_and(|(p, a)| Rc::ptr_eq(p, a))
-    };
-    notebook.remove_page(Some(idx));
-    if was_active {
-        let n = notebook.n_pages().saturating_sub(2);
-        notebook.set_current_page(Some(idx.min(n)));
+    } else {
+        tabview.close_page(&page);
     }
 }
 
 /// Build one tab: per-tab AppState, icon/list views, rubber-band marquee,
-/// statusbar and the refresh closure, then insert it into the notebook.
+/// statusbar and the refresh closure, then insert it into the tab view.
 fn build_pane(
     shared: Shared,
     initial: PathBuf,
-    notebook: &Notebook,
-    active_pane: &Rc<RefCell<Option<Rc<Pane>>>>,
+    tabview: &adw::TabView,
 ) -> Rc<Pane> {
     let state = Rc::new(AppState::new(initial));
 
@@ -1045,25 +1005,15 @@ fn build_pane(
     right_box.append(&overlay);
     right_box.append(&statusbar);
 
-    // --- tab widget: title + close ---
-    let tab_label = Label::new(Some("…"));
-    tab_label.add_css_class("shark-tab-label");
-    tab_label.set_ellipsize(pango::EllipsizeMode::Middle);
-    tab_label.set_max_width_chars(20);
-    let tab_close = Button::from_icon_name("window-close-symbolic");
-    tab_close.add_css_class("flat");
-    tab_close.add_css_class("circular");
-    tab_close.set_valign(gtk::Align::Center);
-    tab_close.set_tooltip_text(Some("Close tab (Ctrl+W)"));
-    let tab_widget = GtkBox::new(Orientation::Horizontal, 4);
-    tab_widget.append(&tab_label);
-    tab_widget.append(&tab_close);
-    notebook.insert_page(
-        &right_box,
-        Some(&tab_widget),
-        Some(notebook.n_pages().saturating_sub(1)),
-    );
-    notebook.set_tab_reorderable(&right_box, true);
+    // --- tab page: title + icon handled by AdwTabView ---
+    let pos = match tabview.selected_page() {
+        Some(cur) => tabview.page_position(&cur) + 1,
+        None => tabview.n_pages(),
+    };
+    let adw_page = tabview.insert(&right_box, pos);
+    adw_page.set_icon(Some(&gio::ThemedIcon::new("folder")));
+    adw_page.set_title("…");
+    tabview.set_selected_page(&adw_page);
 
     let pane_ref = Rc::new(Pane {
         state: state.clone(),
@@ -1075,8 +1025,7 @@ fn build_pane(
         status_sel: status_sel.clone(),
         status_count: status_count.clone(),
         status_label: status_label.clone(),
-        page: right_box.clone(),
-        tab_label: tab_label.clone(),
+        adw_page: adw_page.clone(),
         refresh: Rc::new(RefCell::new(None)),
     });
     unsafe {
@@ -1165,7 +1114,7 @@ fn build_pane(
         let btn_view_toggle = shared.btn_view_toggle.clone();
         let path_entry = shared.path_entry.clone();
         let sort_arrows = sort_arrows.clone();
-        let tab_label = tab_label.clone();
+        let adw_page = adw_page.clone();
         let refresh = pane_ref.refresh.clone();
         let refresh_clone = refresh.clone();
         let refresh_indir = refresh.clone();
@@ -1184,7 +1133,11 @@ fn build_pane(
 
             setup_monitor(&state_c, do_refresh_indir.clone());
 
-            tab_label.set_text(&cur.display().to_string());
+            let title = cur
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| cur.display().to_string());
+            adw_page.set_title(&title);
             window.set_title(Some(&format!("{} — SharkManager 🦈", cur.display())));
 
             // Sort indicator arrows
@@ -1408,17 +1361,6 @@ fn build_pane(
             }
         });
         *refresh.borrow_mut() = Some(dr);
-    }
-
-    // --- tab close button ---
-    {
-        let window = shared.window.clone();
-        let nb = notebook.clone();
-        let ap = active_pane.clone();
-        let page = right_box.clone();
-        tab_close.connect_clicked(move |_| {
-            close_tab(&window, &nb, &ap, &page.clone().upcast::<gtk::Widget>());
-        });
     }
 
     pane_ref
