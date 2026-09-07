@@ -4,6 +4,7 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub name: String,
+    pub name_lower: String,
     pub path: PathBuf,
     pub is_dir: bool,
     pub is_symlink: bool,
@@ -12,6 +13,7 @@ pub struct FileEntry {
     pub modified: SystemTime,
     pub icon_name: String,
     pub mime_approx: String,
+    pub mime_lower: String,
 }
 
 impl FileEntry {
@@ -35,6 +37,8 @@ impl FileEntry {
         let (icon_name, mime_approx) = guess_icon_and_mime(&path, is_dir, is_symlink);
 
         Ok(Self {
+            name_lower: name.to_lowercase(),
+            mime_lower: mime_approx.to_lowercase(),
             name,
             path,
             is_dir,
@@ -131,12 +135,6 @@ pub fn load_directory(
             Err(_) => continue,
         }
     }
-    // Sort: dirs first, then by name case-insensitive
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
     Ok(entries)
 }
 

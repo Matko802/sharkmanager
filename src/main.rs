@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 
 const APP_ID: &str = "io.sharkmanager.SharkManager";
 
+type RefreshFn = Rc<dyn Fn()>;
+type RefreshCell = Rc<RefCell<Option<RefreshFn>>>;
+type AcceptSlot = Rc<RefCell<Option<Box<dyn FnOnce(String)>>>>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Icons,
@@ -52,6 +56,8 @@ struct AppState {
     monitor: RefCell<Option<gio::FileMonitor>>,
     monitored: RefCell<Option<PathBuf>>,
     rescan_pending: Cell<bool>,
+    thumb_gen: Cell<u64>,
+    search_timer: RefCell<Option<glib::SourceId>>,
 }
 
 impl AppState {
@@ -70,6 +76,8 @@ impl AppState {
             monitor: RefCell::new(None),
             monitored: RefCell::new(None),
             rescan_pending: Cell::new(false),
+            thumb_gen: Cell::new(0),
+            search_timer: RefCell::new(None),
         }
     }
 }
@@ -324,6 +332,9 @@ fn build_ui(app: &Application) {
         .build();
     let sidebar = build_sidebar();
     sidebar_scroll.set_child(Some(&sidebar));
+    unsafe {
+        window.set_data("sidebar", sidebar.clone());
+    }
 
     // Tabs: one pane (state + views) per page, plus a trailing "+" page.
     let notebook = gtk::Notebook::new();
@@ -406,6 +417,47 @@ fn build_ui(app: &Application) {
                 }
             }
         });
+    }
+
+    // Sidebar right-click: rename/remove bookmarks, add current folder.
+    {
+        let ap = active_pane.clone();
+        let win = window.clone();
+        let list = sidebar.clone();
+        let right = GestureClick::new();
+        right.set_button(3);
+        right.connect_pressed(move |gest, _, x, y| {
+            let hit = list
+                .row_at_y(y as i32)
+                .and_then(|row| unsafe {
+                    if row.data::<()>("bookmark").is_some() {
+                        row.data::<PathBuf>("path").map(|p| {
+                            let path = p.as_ref().clone();
+                            let items = load_bookmarks();
+                            let name = items
+                                .iter()
+                                .find(|b| b.path == path)
+                                .map(|b| b.name.clone())
+                                .unwrap_or_else(|| {
+                                    path.file_name()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_default()
+                                });
+                            Bookmark { name, path }
+                        })
+                    } else {
+                        None
+                    }
+                });
+            let current = ap
+                .borrow()
+                .as_ref()
+                .map(|p| p.state.current_path.borrow().clone())
+                .unwrap_or_else(|| PathBuf::from("/"));
+            show_sidebar_menu(&win, &list, hit, rect_at(&list, &win, x, y), current);
+            gest.set_state(gtk::EventSequenceState::Claimed);
+        });
+        sidebar.add_controller(right);
     }
 
     // Header button handlers (operate on the active pane)
@@ -507,7 +559,17 @@ fn build_ui(app: &Application) {
         move |e| {
             let Some(pane) = ap.borrow().as_ref().cloned() else { return };
             *pane.state.search_text.borrow_mut() = e.text().to_string();
-            pane.refresh_fn()();
+            if let Some(id) = pane.state.search_timer.borrow_mut().take() {
+                id.remove();
+            }
+            let pane2 = pane.clone();
+            *pane.state.search_timer.borrow_mut() =
+                Some(glib::timeout_add_local_once(
+                    Duration::from_millis(200),
+                    move || {
+                        pane2.refresh_fn()();
+                    },
+                ));
         }
     });
 
@@ -763,11 +825,11 @@ struct Pane {
     status_label: Label,
     page: GtkBox,
     tab_label: Label,
-    refresh: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    refresh: RefreshCell,
 }
 
 impl Pane {
-    fn refresh_fn(&self) -> Rc<dyn Fn()> {
+    fn refresh_fn(&self) -> RefreshFn {
         self.refresh
             .borrow()
             .as_ref()
@@ -821,7 +883,7 @@ fn close_tab(
         let pane = unsafe { page.data::<Rc<Pane>>("pane").map(|p| p.as_ref().clone()) };
         pane.as_ref()
             .zip(ap.as_ref())
-            .map_or(false, |(p, a)| Rc::ptr_eq(p, a))
+            .is_some_and(|(p, a)| Rc::ptr_eq(p, a))
     };
     notebook.remove_page(Some(idx));
     if was_active {
@@ -1021,7 +1083,7 @@ fn build_pane(
         right_box.set_data("pane", pane_ref.clone());
     }
 
-    let pane_refresh: Rc<dyn Fn()> = {
+    let pane_refresh: RefreshFn = {
         let cell = pane_ref.refresh.clone();
         Rc::new(move || {
             if let Some(f) = cell.borrow().as_ref() {
@@ -1108,13 +1170,13 @@ fn build_pane(
         let refresh_clone = refresh.clone();
         let refresh_indir = refresh.clone();
 
-        let do_refresh_indir: Rc<dyn Fn()> = Rc::new(move || {
+        let do_refresh_indir: RefreshFn = Rc::new(move || {
             if let Some(f) = refresh_indir.borrow().as_ref() {
                 f();
             }
         });
 
-        let dr: Rc<dyn Fn()> = Rc::new(move || {
+        let dr: RefreshFn = Rc::new(move || {
             let cur = state_c.current_path.borrow().clone();
             let show_hidden = state_c.show_hidden.get();
             let view_mode = state_c.view_mode.get();
@@ -1210,7 +1272,7 @@ fn build_pane(
                 }
             }
 
-            let drop_refresh: Rc<dyn Fn()> = {
+            let drop_refresh: RefreshFn = {
                 let cell = refresh_clone.clone();
                 Rc::new(move || {
                     if let Some(f) = cell.borrow().as_ref() {
@@ -1219,8 +1281,12 @@ fn build_pane(
                 })
             };
 
-            for entry in entries.clone() {
-                let w = build_icon_tile(&entry);
+            let thumb_gen = state_c.thumb_gen.get().wrapping_add(1);
+            state_c.thumb_gen.set(thumb_gen);
+
+            if view_mode == ViewMode::Icons {
+                for entry in &entries {
+                    let w = build_icon_tile(entry, thumb_gen);
                 let child = FlowBoxChild::new();
                 child.set_child(Some(&w));
                 unsafe {
@@ -1276,10 +1342,12 @@ fn build_pane(
                     drop_refresh.clone(),
                 );
                 flow.append(&child);
+                }
             }
 
-            for entry in entries {
-                let row_widget = build_list_row(&entry);
+            if view_mode == ViewMode::List {
+                for entry in &entries {
+                    let row_widget = build_list_row(entry);
                 let row = ListBoxRow::new();
                 row.add_css_class("shark-row");
                 row.set_child(Some(&row_widget));
@@ -1336,6 +1404,7 @@ fn build_pane(
                     drop_refresh.clone(),
                 );
                 list_box.append(&row);
+                }
             }
         });
         *refresh.borrow_mut() = Some(dr);
@@ -1383,7 +1452,7 @@ fn navigate_to(state: &AppState, path: PathBuf) {
 /// (Re)create a gio::FileMonitor on the current directory so the view refreshes
 /// automatically when files are added/removed/renamed by other apps. Only one
 /// monitor is kept per tab (recreated when the path changes).
-fn setup_monitor(state: &Rc<AppState>, do_refresh: Rc<dyn Fn()>) {
+fn setup_monitor(state: &Rc<AppState>, do_refresh: RefreshFn) {
     let path = state.current_path.borrow().clone();
     if state.monitored.borrow().as_deref() == Some(path.as_path()) {
         return;
@@ -1399,10 +1468,11 @@ fn setup_monitor(state: &Rc<AppState>, do_refresh: Rc<dyn Fn()>) {
                     if let Some(parent) = cur.parent() {
                         navigate_to(&st, parent.to_path_buf());
                         dr();
+                        return;
                     }
                 }
                 // Debounce bursts of events into at most one refresh per 250ms.
-                if st.rescan_pending.replace(true) {
+                if !st.rescan_pending.replace(true) {
                     let st2 = st.clone();
                     let dr2 = dr.clone();
                     glib::timeout_add_local(Duration::from_millis(250), move || {
@@ -1422,7 +1492,7 @@ fn setup_monitor(state: &Rc<AppState>, do_refresh: Rc<dyn Fn()>) {
     }
 }
 
-fn set_sort(state: &Rc<AppState>, col: SortCol, do_refresh: Rc<dyn Fn()>) {
+fn set_sort(state: &Rc<AppState>, col: SortCol, do_refresh: RefreshFn) {
     if state.sort_col.get() == col {
         state.sort_asc.set(!state.sort_asc.get());
     } else {
@@ -1441,17 +1511,15 @@ fn sort_entries(entries: &mut [FileEntry], col: SortCol, asc: bool) {
         }
         let c = match col {
             SortCol::Name => a
-                .name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
+                .name_lower
+                .cmp(&b.name_lower)
                 .then_with(|| a.name.cmp(&b.name)),
             SortCol::Size => a.size.cmp(&b.size),
             SortCol::Modified => a.modified.cmp(&b.modified),
             SortCol::Type => a
-                .mime_approx
-                .to_lowercase()
-                .cmp(&b.mime_approx.to_lowercase())
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                .mime_lower
+                .cmp(&b.mime_lower)
+                .then_with(|| a.name_lower.cmp(&b.name_lower)),
         };
         if asc {
             c
@@ -1518,7 +1586,197 @@ where
     }
 }
 
-fn build_icon_tile(entry: &FileEntry) -> GtkBox {
+struct ThumbJob {
+    id: u64,
+    path: PathBuf,
+    size: i32,
+    video: bool,
+    cache_key: String,
+    gen: u64,
+}
+
+struct ThumbDone {
+    id: u64,
+    cache_key: String,
+    gen: u64,
+    pix: Option<RawPix>,
+}
+
+struct RawPix {
+    bytes: glib::Bytes,
+    w: i32,
+    h: i32,
+    stride: i32,
+    alpha: bool,
+}
+
+fn raw_pixbuf(p: &gdk_pixbuf::Pixbuf) -> RawPix {
+    RawPix {
+        bytes: p.read_pixel_bytes(),
+        w: p.width(),
+        h: p.height(),
+        stride: p.rowstride(),
+        alpha: p.has_alpha(),
+    }
+}
+
+std::thread_local! {
+    static THUMB_PENDING: std::cell::RefCell<std::collections::HashMap<u64, glib::WeakRef<gtk::Image>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+static THUMB_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static THUMB_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static THUMB_POLLER_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn thumb_results() -> &'static std::sync::Mutex<Vec<ThumbDone>> {
+    static Q: std::sync::OnceLock<std::sync::Mutex<Vec<ThumbDone>>> =
+        std::sync::OnceLock::new();
+    Q.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn thumb_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, gdk::Texture>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, gdk::Texture>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn thumb_cache_key(entry: &FileEntry, px: i32, video: bool) -> String {
+    let mtime = entry
+        .modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!(
+        "{}|{}|{}|{}|{}",
+        entry.path.display(),
+        entry.size,
+        mtime,
+        px,
+        video as u8
+    )
+}
+
+fn cached_thumb(entry: &FileEntry, px: i32, video: bool) -> Option<gdk::Texture> {
+    let key = thumb_cache_key(entry, px, video);
+    thumb_cache().lock().ok()?.get(&key).cloned()
+}
+
+fn decode_scaled(path: &Path, size: i32) -> Option<gdk_pixbuf::Pixbuf> {
+    let s = size.max(16);
+    gdk_pixbuf::Pixbuf::from_file_at_size(path, s, s).ok()
+}
+
+struct ThumbPool {
+    senders: [std::sync::mpsc::Sender<ThumbJob>; 4],
+    next: std::sync::atomic::AtomicUsize,
+}
+
+fn thumb_pool() -> &'static ThumbPool {
+    static POOL: std::sync::OnceLock<ThumbPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let senders = [(); 4].map(|_| {
+            let (tx, rx) = std::sync::mpsc::channel::<ThumbJob>();
+            std::thread::spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let raw = if job.video {
+                        gen_video_thumb(&job.path)
+                            .and_then(|f| decode_scaled(&f, job.size))
+                            .map(|p| raw_pixbuf(&p))
+                    } else {
+                        decode_scaled(&job.path, job.size).map(|p| raw_pixbuf(&p))
+                    };
+                    if let Ok(mut q) = thumb_results().lock() {
+                        q.push(ThumbDone {
+                            id: job.id,
+                            cache_key: job.cache_key,
+                            gen: job.gen,
+                            pix: raw,
+                        });
+                    }
+                    THUMB_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            tx
+        });
+        ThumbPool {
+            senders,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    })
+}
+
+fn thumb_pump() {
+    let done: Vec<ThumbDone> = thumb_results()
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default();
+    for d in done {
+        let weak = THUMB_PENDING.with(|m| m.borrow_mut().remove(&d.id));
+        let Some(weak) = weak else { continue };
+        let Some(img) = weak.upgrade() else { continue };
+        let cur = unsafe { img.data::<u64>("thumb_gen").map(|g| *g.as_ref()) }
+            .unwrap_or(u64::MAX);
+        if cur != d.gen {
+            continue;
+        }
+        if let Some(r) = d.pix {
+            let pix = gdk_pixbuf::Pixbuf::from_bytes(
+                &r.bytes,
+                gdk_pixbuf::Colorspace::Rgb,
+                r.alpha,
+                8,
+                r.w,
+                r.h,
+                r.stride,
+            );
+            let tex = gdk::Texture::for_pixbuf(&pix);
+            if let Ok(mut cache) = thumb_cache().lock() {
+                if cache.len() >= 800 {
+                    cache.clear();
+                }
+                cache.insert(d.cache_key, tex.clone());
+            }
+            img.set_paintable(Some(&tex));
+        }
+    }
+}
+
+fn ensure_thumb_poller() {
+    if THUMB_POLLER_ON.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        thumb_pump();
+        if THUMB_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            thumb_pump();
+            THUMB_POLLER_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn request_thumb(entry: &FileEntry, img: &gtk::Image, size: i32, video: bool, gen: u64) {
+    let key = thumb_cache_key(entry, size, video);
+    unsafe {
+        img.set_data("thumb_gen", gen);
+    }
+    let id = THUMB_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THUMB_PENDING.with(|m| m.borrow_mut().insert(id, img.downgrade()));
+    THUMB_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pool = thumb_pool();
+    let n = pool.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let job = ThumbJob { id, path: entry.path.clone(), size, video, cache_key: key, gen };
+    if pool.senders[n % pool.senders.len()].send(job).is_err() {
+        THUMB_PENDING.with(|m| m.borrow_mut().remove(&id));
+        THUMB_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ensure_thumb_poller();
+}
+
+fn build_icon_tile(entry: &FileEntry, gen: u64) -> GtkBox {
     const ICON_SIZE: i32 = 44;
     const THUMB_SIZE: i32 = 56;
 
@@ -1544,10 +1802,10 @@ fn build_icon_tile(entry: &FileEntry) -> GtkBox {
         let icon = gtk::Image::from_icon_name("video-x-generic");
         icon.set_pixel_size(ICON_SIZE);
         vbox.append(&icon);
-        spawn_video_thumb(&entry.path, icon, THUMB_SIZE);
+        request_thumb(entry, &icon, THUMB_SIZE, true, gen);
     } else if entry.mime_approx.starts_with("image/") {
-        if let Some(pix) = fit_thumb(&entry.path, THUMB_SIZE) {
-            let img = gtk::Image::from_pixbuf(Some(&pix));
+        if let Some(tex) = cached_thumb(entry, THUMB_SIZE, false) {
+            let img = gtk::Image::from_paintable(Some(&tex));
             img.set_pixel_size(THUMB_SIZE);
             img.set_halign(gtk::Align::Center);
             vbox.append(&img);
@@ -1555,6 +1813,7 @@ fn build_icon_tile(entry: &FileEntry) -> GtkBox {
             let icon = gtk::Image::from_icon_name(&entry.icon_name);
             icon.set_pixel_size(ICON_SIZE);
             vbox.append(&icon);
+            request_thumb(entry, &icon, THUMB_SIZE, false, gen);
         }
     } else {
         let icon = gtk::Image::from_icon_name(&entry.icon_name);
@@ -1579,49 +1838,6 @@ fn build_icon_tile(entry: &FileEntry) -> GtkBox {
     vbox.append(&label);
 
     vbox
-}
-
-fn fit_thumb(path: &Path, max: i32) -> Option<gdk_pixbuf::Pixbuf> {
-    let pix = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
-    let w = pix.width();
-    let h = pix.height();
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    let scale = (max as f64) / (w.max(h) as f64);
-    let nw = (w as f64 * scale).round().max(1.0) as i32;
-    let nh = (h as f64 * scale).round().max(1.0) as i32;
-    pix.scale_simple(nw, nh, gdk_pixbuf::InterpType::Bilinear)
-}
-
-fn spawn_video_thumb(path: &Path, img: gtk::Image, size: i32) {
-    let path = path.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(gen_video_thumb(&path));
-    });
-    let img = img.clone();
-    let mut tries: u32 = 0;
-    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-        tries += 1;
-        if tries > 600 {
-            return glib::ControlFlow::Break;
-        }
-        match rx.try_recv() {
-            Ok(Some(tmp)) => {
-                if let Some(pix) = fit_thumb(&tmp, size) {
-                    img.set_from_pixbuf(Some(&pix));
-                    if std::env::var("SHARK_DEBUG_LAYOUT").is_ok() {
-                        eprintln!("[thumb] applied {} -> {}x{}", tmp.display(), pix.width(), pix.height());
-                    }
-                }
-                glib::ControlFlow::Break
-            }
-            Ok(None) => glib::ControlFlow::Break,
-            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        }
-    });
 }
 
 fn gen_video_thumb(path: &Path) -> Option<PathBuf> {
@@ -1780,6 +1996,140 @@ fn xdg_user_dir(name: &str) -> Option<PathBuf> {
     dirs.into_iter().next()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bookmark {
+    name: String,
+    path: PathBuf,
+}
+
+fn bookmark_files() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.join(".config/gtk-4.0/bookmarks"));
+        out.push(home.join(".config/gtk-3.0/bookmarks"));
+    }
+    out
+}
+
+fn load_bookmarks() -> Vec<Bookmark> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for file in bookmark_files() {
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, ' ');
+            let uri = parts.next().unwrap_or("");
+            let label = parts.next().unwrap_or("").trim();
+            if !uri.starts_with("file://") {
+                continue;
+            }
+            let path = PathBuf::from(percent_decode(uri.trim_start_matches("file://")));
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let name = if label.is_empty() {
+                path.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string())
+            } else {
+                label.to_string()
+            };
+            out.push(Bookmark { name, path });
+        }
+    }
+    out
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"/?:@&=+$,;_-.!~*'()".contains(&b) {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{b:02X}"));
+        }
+    }
+    o
+}
+
+fn save_bookmarks(items: &[Bookmark]) {
+    let mut text = String::new();
+    for b in items {
+        let uri = format!("file://{}", percent_encode(&b.path.to_string_lossy()));
+        if b.name.trim().is_empty() {
+            text.push_str(&uri);
+        } else {
+            text.push_str(&format!("{} {}", uri, b.name.trim()));
+        }
+        text.push('\n');
+    }
+    for file in bookmark_files() {
+        let Some(parent) = file.parent() else { continue };
+        if std::fs::create_dir_all(parent).is_err() {
+            continue;
+        }
+        let _ = std::fs::write(&file, &text);
+    }
+}
+
+fn append_bookmark_rows(list: &ListBox) {
+    let items = load_bookmarks();
+    if items.is_empty() {
+        return;
+    }
+    let lbl = Label::new(Some("Bookmarks"));
+    lbl.set_xalign(0.0);
+    lbl.add_css_class("sidebar-title");
+    let header = ListBoxRow::new();
+    header.set_selectable(false);
+    header.set_activatable(false);
+    header.set_child(Some(&lbl));
+    unsafe {
+        header.set_data("bookmark_header", ());
+    }
+    list.append(&header);
+    for b in items {
+        let row = ListBoxRow::new();
+        let h = GtkBox::new(Orientation::Horizontal, 8);
+        h.set_margin_top(4);
+        h.set_margin_bottom(4);
+        h.set_margin_start(8);
+        h.set_margin_end(8);
+        let img = gtk::Image::from_icon_name("folder-bookmark-symbolic");
+        img.set_pixel_size(18);
+        h.append(&img);
+        row.set_child(Some(&h));
+        row.set_tooltip_text(Some(&format!("{}\n{}", b.name, b.path.display())));
+        unsafe {
+            row.set_data("path", b.path);
+            row.set_data("bookmark", ());
+        }
+        list.append(&row);
+    }
+}
+
+fn refresh_bookmark_rows(list: &ListBox) {
+    let mut dead = Vec::new();
+    let mut c = list.first_child();
+    while let Some(w) = c {
+        let tagged = unsafe { w.data::<()>("bookmark").is_some() || w.data::<()>("bookmark_header").is_some() };
+        if tagged {
+            dead.push(w.clone());
+        }
+        c = w.next_sibling();
+    }
+    for w in dead {
+        list.remove(&w);
+    }
+    append_bookmark_rows(list);
+}
+
 fn build_sidebar() -> ListBox {
     let list = ListBox::new();
     list.add_css_class("shark-sidebar");
@@ -1839,45 +2189,8 @@ add_item(icon, &label, path, &list);
     }
     add_item("drive-harddisk-symbolic", "File System", PathBuf::from("/"), &list);
     add_item("user-trash-symbolic", "Trash", dirs::home_dir().unwrap_or(PathBuf::from("/")).join(".local/share/Trash/files"), &list);
-    // Bookmarks
-    let bookmark_file = dirs::home_dir()
-        .unwrap_or(PathBuf::from("/"))
-        .join(".config/gtk-3.0/bookmarks");
-    if bookmark_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&bookmark_file) {
-            let mut has_bookmarks = false;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let mut parts = line.splitn(2, ' ');
-                let uri = parts.next().unwrap_or("");
-                let label = parts.next().unwrap_or("");
-                if uri.starts_with("file://") {
-                    let path_str = uri.trim_start_matches("file://");
-                    let path = PathBuf::from(path_str);
-                    let name = if label.is_empty() {
-                        path.file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| path.display().to_string())
-                    } else {
-                        label.to_string()
-                    };
-                    if !has_bookmarks {
-                        add_section("Bookmarks", &list);
-                        has_bookmarks = true;
-                    }
-                    add_item("folder-bookmark-symbolic", &name, path, &list);
-                }
-            }
-        }
-        // also try gtk-4.0 bookmarks
-        let bookmark_file4 = dirs::home_dir().unwrap().join(".config/gtk-4.0/bookmarks");
-        if bookmark_file4.exists() {
-            // similar
-        }
-    }
+    // Bookmarks (icon-only rows with tooltips; editable via right-click)
+    append_bookmark_rows(&list);
     // Devices / network
     add_section("Devices", &list);
     for (name, mnt) in mounted_devices() {
@@ -1920,7 +2233,8 @@ fn mounted_devices() -> Vec<(String, PathBuf)> {
 
 fn rect_at(widget: &impl gtk::prelude::WidgetExt, window: &ApplicationWindow, x: f64, y: f64) -> gdk::Rectangle {
     let (wx, wy) = widget
-        .translate_coordinates(window, x, y)
+        .compute_point(window, &graphene::Point::new(x as f32, y as f32))
+        .map(|p| (p.x() as f64, p.y() as f64))
         .unwrap_or((x, y));
     gdk::Rectangle::new(wx.round() as i32, wy.round() as i32, 1, 1)
 }
@@ -1984,9 +2298,11 @@ struct CachedApp {
 
 /// Installed apps (id + display name), cached briefly so right-clicking doesn't
 /// rescan every .desktop file on the main thread (which used to stall the UI).
+type AppCache = (Instant, Vec<CachedApp>);
+
 fn all_apps_cached() -> Vec<CachedApp> {
     const TTL: Duration = Duration::from_secs(90);
-    static CACHE: OnceLock<Mutex<Option<(Instant, Vec<CachedApp>)>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Option<AppCache>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().unwrap();
     if let Some((at, apps)) = &*guard {
@@ -2047,7 +2363,7 @@ fn show_context_menu(
     path: &Path,
     is_dir: bool,
     pos: gdk::Rectangle,
-    do_refresh: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    do_refresh: RefreshCell,
 ) {
     let path_buf2 = path.to_path_buf();
     let action_group = gio::SimpleActionGroup::new();
@@ -2076,7 +2392,7 @@ fn show_context_menu(
             let ct = ctype.clone();
             let win = window.clone();
             let def_source = window.title().unwrap_or_default().to_string();
-            let open_act = gio::SimpleAction::new("open_with", Some(&glib::VariantTy::STRING));
+            let open_act = gio::SimpleAction::new("open_with", Some(glib::VariantTy::STRING));
             open_act.connect_activate(move |_, param| {
                 let key = param.and_then(|v| v.str()).map(str::to_owned);
                 if let Some(key) = key {
@@ -2245,11 +2561,108 @@ fn show_context_menu(
     pop.popup();
 }
 
+fn add_bookmark_dir(path: &Path) {
+    let mut items = load_bookmarks();
+    if items.iter().any(|b| b.path == path) {
+        return;
+    }
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    items.push(Bookmark { name, path: path.to_path_buf() });
+    save_bookmarks(&items);
+}
+
+fn refresh_sidebar_bookmarks(window: &ApplicationWindow) {
+    let list: Option<ListBox> =
+        unsafe { window.data::<ListBox>("sidebar").map(|r| r.as_ref().clone()) };
+    if let Some(list) = list {
+        refresh_bookmark_rows(&list);
+    }
+}
+
+fn show_sidebar_menu(
+    window: &ApplicationWindow,
+    list: &ListBox,
+    hit: Option<Bookmark>,
+    pos: gdk::Rectangle,
+    current: PathBuf,
+) {
+    let menu = gio::Menu::new();
+    let section = gio::Menu::new();
+    if hit.is_some() {
+        section.append(Some("Rename…"), Some("sbar.rename"));
+        section.append(Some("Remove"), Some("sbar.remove"));
+    } else {
+        section.append(Some("Add Bookmark"), Some("sbar.add"));
+    }
+    menu.append_section(None, &section);
+    let pop = PopoverMenu::from_model(Some(&menu));
+    pop.set_has_arrow(false);
+    pop.set_pointing_to(Some(&pos));
+    pop.set_parent(window);
+    let g = gio::SimpleActionGroup::new();
+    window.insert_action_group("sbar", Some(&g));
+    if let Some(bm) = hit {
+        let w = window.clone();
+        let list_c = list.clone();
+        let old_name = bm.name.clone();
+        let old_path = bm.path.clone();
+        let a = gio::SimpleAction::new("rename", None);
+        a.connect_activate(move |_, _| {
+            let list_c2 = list_c.clone();
+            let oname = old_name.clone();
+            let opath = old_path.clone();
+            prompt_entry(
+                &w,
+                "Rename Bookmark",
+                &opath.display().to_string(),
+                "Bookmark name",
+                &oname.clone(),
+                "Rename",
+                move |name| {
+                    let name = name.trim().to_string();
+                    if name.is_empty() || name == oname {
+                        return;
+                    }
+                    let mut items = load_bookmarks();
+                    if let Some(b) = items.iter_mut().find(|b| b.path == opath) {
+                        b.name = name;
+                        save_bookmarks(&items);
+                        refresh_bookmark_rows(&list_c2);
+                    }
+                },
+            );
+        });
+        g.add_action(&a);
+        let list_c = list.clone();
+        let a = gio::SimpleAction::new("remove", None);
+        a.connect_activate(move |_, _| {
+            let mut items = load_bookmarks();
+            items.retain(|b| b.path != bm.path);
+            save_bookmarks(&items);
+            refresh_bookmark_rows(&list_c);
+        });
+        g.add_action(&a);
+    } else {
+        let w = window.clone();
+        let a = gio::SimpleAction::new("add", None);
+        a.connect_activate(move |_, _| {
+            add_bookmark_dir(&current);
+            refresh_sidebar_bookmarks(&w);
+        });
+        g.add_action(&a);
+    }
+    clamp_popover_to_window(pop.upcast_ref(), window);
+    pop.popup();
+}
+
 fn show_background_menu(
     window: &ApplicationWindow,
     state: &Rc<AppState>,
     pos: gdk::Rectangle,
-    do_refresh: Rc<dyn Fn()>,
+    do_refresh: RefreshFn,
 ) {
     let menu = gio::Menu::new();
     let s1 = gio::Menu::new();
@@ -2259,6 +2672,7 @@ fn show_background_menu(
     menu.append_section(None, &s1);
     let s2 = gio::Menu::new();
     s2.append(Some("Open in Terminal"), Some("bg.terminal"));
+    s2.append(Some("Add Bookmark"), Some("bg.bookmark"));
     s2.append(Some("Refresh"), Some("bg.refresh"));
     s2.append(Some("Properties"), Some("bg.props"));
     menu.append_section(None, &s2);
@@ -2310,6 +2724,15 @@ fn show_background_menu(
     let dr2 = do_refresh.clone();
     let a = gio::SimpleAction::new("refresh", None);
     a.connect_activate(move |_, _| dr2());
+    g.add_action(&a);
+
+    let state_c = state.clone();
+    let w = window.clone();
+    let a = gio::SimpleAction::new("bookmark", None);
+    a.connect_activate(move |_, _| {
+        add_bookmark_dir(&state_c.current_path.borrow().clone());
+        refresh_sidebar_bookmarks(&w);
+    });
     g.add_action(&a);
 
     let w2 = window.clone();
@@ -2388,7 +2811,7 @@ fn context_items(state: &AppState, clicked: &Path) -> Vec<PathBuf> {
 /// `gdk::FileList` (serialised to text/uri-list etc.), so other apps like
 /// Dolphin / GNOME Files can paste them.
 fn file_list_from_paths(paths: &[PathBuf]) -> gdk::FileList {
-    let files: Vec<gio::File> = paths.iter().map(|p| gio::File::for_path(p)).collect();
+    let files: Vec<gio::File> = paths.iter().map(gio::File::for_path).collect();
     gdk::FileList::from_array(&files)
 }
 
@@ -2435,7 +2858,7 @@ fn paste_paths(
     paths: &[PathBuf],
     is_cut: bool,
     dest: &Path,
-    do_refresh: Rc<dyn Fn()>,
+    do_refresh: RefreshFn,
 ) {
     for src in paths {
         let name = src
@@ -2463,7 +2886,7 @@ fn paste_paths(
 
 /// Paste from the system clipboard if it holds files, otherwise fall back to
 /// the app-internal clipboard. Non-file clipboard content is ignored.
-fn do_paste(window: &ApplicationWindow, state: &Rc<AppState>, do_refresh: Rc<dyn Fn()>, dest: PathBuf) {
+fn do_paste(window: &ApplicationWindow, state: &Rc<AppState>, do_refresh: RefreshFn, dest: PathBuf) {
     let window = window.clone();
     let state = state.clone();
     read_system_clipboard_files(move |ext| {
@@ -2525,7 +2948,7 @@ fn install_drop(
     host: &gtk::Widget,
     window: &ApplicationWindow,
     _state: &Rc<AppState>,
-    refresh: Rc<dyn Fn()>,
+    refresh: RefreshFn,
     dest: impl Fn() -> PathBuf + 'static,
 ) {
     let window = window.clone();
@@ -2606,7 +3029,7 @@ fn install_drop_for_item(
     state: &Rc<AppState>,
     item_path: PathBuf,
     is_dir: bool,
-    refresh: Rc<dyn Fn()>,
+    refresh: RefreshFn,
 ) {
     let dest_state = state.clone();
     install_drop(
@@ -2635,11 +3058,15 @@ fn children_in_rect(host: &gtk::Widget, rect: &gdk::Rectangle) -> HashSet<PathBu
     let mut out = HashSet::new();
     let mut c = host.first_child();
     while let Some(w) = c {
-        let a = w.allocation();
-        if rect_overlaps(rect, &a) {
-            unsafe {
-                if let Some(p) = w.data::<PathBuf>("path") {
-                    out.insert(p.as_ref().clone());
+        let bounds = w.compute_bounds(host).map(|r| {
+            gdk::Rectangle::new(r.x() as i32, r.y() as i32, r.width() as i32, r.height() as i32)
+        });
+        if let Some(a) = bounds {
+            if rect_overlaps(rect, &a) {
+                unsafe {
+                    if let Some(p) = w.data::<PathBuf>("path") {
+                        out.insert(p.as_ref().clone());
+                    }
                 }
             }
         }
@@ -2818,136 +3245,129 @@ fn update_status_sel(status_sel: &Label, set: &HashSet<PathBuf>) {
     status_sel.set_text(&s);
 }
 
-fn prompt_new_folder(window: &ApplicationWindow, state: &Rc<AppState>, do_refresh: Rc<dyn Fn()>) {
-    let cur = state.current_path.borrow().clone();
-    let dialog = gtk::Dialog::builder()
-        .title("New Folder")
+fn prompt_entry(
+    window: &ApplicationWindow,
+    title: &str,
+    detail: &str,
+    placeholder: &str,
+    initial: &str,
+    ok_label: &str,
+    on_accept: impl FnOnce(String) + 'static,
+) {
+    let dlg = gtk::Window::builder()
+        .title(title)
         .transient_for(window)
         .modal(true)
+        .default_width(400)
         .build();
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-    dialog.add_button("Create", gtk::ResponseType::Accept);
-    dialog.set_default_response(gtk::ResponseType::Accept);
-
-    let content = dialog.content_area();
-    let v = GtkBox::new(Orientation::Vertical, 8);
-    v.set_margin_top(12);
-    v.set_margin_bottom(12);
-    v.set_margin_start(12);
-    v.set_margin_end(12);
-    let lbl = Label::new(Some(&format!("Create folder in {}", cur.display())));
+    let v = GtkBox::new(Orientation::Vertical, 10);
+    v.set_margin_top(16);
+    v.set_margin_bottom(16);
+    v.set_margin_start(16);
+    v.set_margin_end(16);
+    let lbl = Label::new(Some(detail));
     lbl.set_xalign(0.0);
+    lbl.set_wrap(true);
     let entry = Entry::new();
-    entry.set_placeholder_text(Some("Folder name"));
-    entry.set_text("Untitled Folder");
+    entry.set_placeholder_text(Some(placeholder));
+    entry.set_text(initial);
     entry.select_region(0, -1);
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_halign(gtk::Align::End);
+    let cancel = Button::with_label("Cancel");
+    let ok = Button::with_label(ok_label);
+    ok.add_css_class("suggested-action");
+    row.append(&cancel);
+    row.append(&ok);
     v.append(&lbl);
     v.append(&entry);
-    content.append(&v);
+    v.append(&row);
+    dlg.set_child(Some(&v));
 
-    let cur_c = cur.clone();
+    let accept: AcceptSlot = AcceptSlot::new(RefCell::new(Some(Box::new(on_accept))));
+    let run = {
+        let accept = accept.clone();
+        let entry_c = entry.clone();
+        let dlg_c = dlg.clone();
+        move || {
+            if let Some(f) = accept.borrow_mut().take() {
+                f(entry_c.text().to_string());
+            }
+            dlg_c.close();
+        }
+    };
+    let run_ok = run.clone();
+    ok.connect_clicked(move |_| run_ok());
+    entry.connect_activate(move |_| run());
+    {
+        let dlg_c = dlg.clone();
+        cancel.connect_clicked(move |_| dlg_c.close());
+    }
+    dlg.present();
+    glib::idle_add_local_once({
+        let entry = entry.clone();
+        move || {
+            entry.grab_focus();
+        }
+    });
+}
+
+fn prompt_new_folder(window: &ApplicationWindow, state: &Rc<AppState>, do_refresh: RefreshFn) {
+    let cur = state.current_path.borrow().clone();
     let w = window.clone();
-    let entry_c = entry.clone();
-    dialog.connect_response(move |d, resp| {
-        if resp == gtk::ResponseType::Accept {
-            let name = entry_c.text().to_string();
+    prompt_entry(
+        window,
+        "New Folder",
+        &format!("Create folder in {}", cur.display()),
+        "Folder name",
+        "Untitled Folder",
+        "Create",
+        move |name| {
             if !name.trim().is_empty() {
-                match create_dir(&cur_c, name.trim()) {
+                match create_dir(&cur, name.trim()) {
                     Ok(_) => do_refresh(),
                     Err(e) => show_error(&w, &format!("Failed to create folder: {e}")),
                 }
             }
-        }
-        d.close();
-    });
-    dialog.present();
-    // focus
-    // entry.grab_focus() after present
-    glib::idle_add_local_once({
-        let entry = entry.clone();
-        move || { entry.grab_focus(); }
-    });
+        },
+    );
 }
 
-fn prompt_new_file(window: &ApplicationWindow, state: &Rc<AppState>, do_refresh: Rc<dyn Fn()>) {
+fn prompt_new_file(window: &ApplicationWindow, state: &Rc<AppState>, do_refresh: RefreshFn) {
     let cur = state.current_path.borrow().clone();
-    let dialog = gtk::Dialog::builder()
-        .title("New File")
-        .transient_for(window)
-        .modal(true)
-        .build();
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-    dialog.add_button("Create", gtk::ResponseType::Accept);
-    dialog.set_default_response(gtk::ResponseType::Accept);
-    let content = dialog.content_area();
-    let v = GtkBox::new(Orientation::Vertical, 8);
-    v.set_margin_top(12);
-    v.set_margin_bottom(12);
-    v.set_margin_start(12);
-    v.set_margin_end(12);
-    let lbl = Label::new(Some(&format!("Create file in {}", cur.display())));
-    lbl.set_xalign(0.0);
-    let entry = Entry::new();
-    entry.set_placeholder_text(Some("File name"));
-    entry.set_text("Untitled.txt");
-    entry.select_region(0, -1);
-    v.append(&lbl);
-    v.append(&entry);
-    content.append(&v);
-    let cur_c = cur.clone();
     let w = window.clone();
-    let entry_c = entry.clone();
-    dialog.connect_response(move |d, resp| {
-        if resp == gtk::ResponseType::Accept {
-            let name = entry_c.text().to_string();
+    prompt_entry(
+        window,
+        "New File",
+        &format!("Create file in {}", cur.display()),
+        "File name",
+        "Untitled.txt",
+        "Create",
+        move |name| {
             if !name.trim().is_empty() {
-                match create_file(&cur_c, name.trim()) {
+                match create_file(&cur, name.trim()) {
                     Ok(_) => do_refresh(),
                     Err(e) => show_error(&w, &format!("Failed to create file: {e}")),
                 }
             }
-        }
-        d.close();
-    });
-    dialog.present();
-    glib::idle_add_local_once({
-        let entry = entry.clone();
-        move || { entry.grab_focus(); }
-    });
+        },
+    );
 }
 
-fn prompt_rename(window: &ApplicationWindow, path: &Path, do_refresh: Rc<dyn Fn()>) {
+fn prompt_rename(window: &ApplicationWindow, path: &Path, do_refresh: RefreshFn) {
     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-    let dialog = gtk::Dialog::builder()
-        .title("Rename")
-        .transient_for(window)
-        .modal(true)
-        .build();
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-    dialog.add_button("Rename", gtk::ResponseType::Accept);
-    dialog.set_default_response(gtk::ResponseType::Accept);
-    let content = dialog.content_area();
-    let v = GtkBox::new(Orientation::Vertical, 8);
-    v.set_margin_top(12);
-    v.set_margin_bottom(12);
-    v.set_margin_start(12);
-    v.set_margin_end(12);
-    let lbl = Label::new(Some(&format!("Rename \"{}\"", name)));
-    lbl.set_xalign(0.0);
-    let entry = Entry::new();
-    entry.set_text(&name);
-    entry.select_region(0, -1);
-    v.append(&lbl);
-    v.append(&entry);
-    content.append(&v);
     let path_buf = path.to_path_buf();
     let w = window.clone();
-    let entry_c = entry.clone();
     let name_c = name.clone();
-    dialog.connect_response(move |d, resp| {
-        if resp == gtk::ResponseType::Accept {
-            let new_name = entry_c.text().to_string();
+    prompt_entry(
+        window,
+        "Rename",
+        &format!("Rename \"{}\"", name),
+        "New name",
+        &name,
+        "Rename",
+        move |new_name| {
             if !new_name.trim().is_empty() && new_name != name_c {
                 let dst = parent.join(new_name.trim());
                 if dst.exists() {
@@ -2959,14 +3379,8 @@ fn prompt_rename(window: &ApplicationWindow, path: &Path, do_refresh: Rc<dyn Fn(
                     }
                 }
             }
-        }
-        d.close();
-    });
-    dialog.present();
-    glib::idle_add_local_once({
-        let entry = entry.clone();
-        move || { entry.grab_focus(); }
-    });
+        },
+    );
 }
 
 fn describe_paths(paths: &[PathBuf]) -> String {
@@ -2988,7 +3402,7 @@ fn describe_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-fn confirm_and_trash(window: &ApplicationWindow, paths: &[PathBuf], do_refresh: Rc<dyn Fn()>) {
+fn confirm_and_trash(window: &ApplicationWindow, paths: &[PathBuf], do_refresh: RefreshFn) {
     let what = describe_paths(paths);
     let dialog = gtk::AlertDialog::builder()
         .modal(true)
@@ -3017,7 +3431,7 @@ fn confirm_and_trash(window: &ApplicationWindow, paths: &[PathBuf], do_refresh: 
     });
 }
 
-fn confirm_and_delete_permanent(window: &ApplicationWindow, paths: &[PathBuf], do_refresh: Rc<dyn Fn()>) {
+fn confirm_and_delete_permanent(window: &ApplicationWindow, paths: &[PathBuf], do_refresh: RefreshFn) {
     let what = describe_paths(paths);
     let dialog = gtk::AlertDialog::builder()
         .modal(true)
@@ -3046,20 +3460,35 @@ fn confirm_and_delete_permanent(window: &ApplicationWindow, paths: &[PathBuf], d
     });
 }
 
-fn show_properties(window: &ApplicationWindow, path: &Path) {
-    let meta = std::fs::symlink_metadata(path);
-    let dialog = gtk::Dialog::builder()
-        .title(format!("Properties — {}", path.file_name().unwrap_or_default().to_string_lossy()))
+fn show_info(window: &ApplicationWindow, title: &str, body: &gtk::Widget) {
+    let dlg = gtk::Window::builder()
+        .title(title)
         .transient_for(window)
         .modal(true)
+        .default_width(480)
         .build();
-    dialog.add_button("Close", gtk::ResponseType::Close);
-    let content = dialog.content_area();
+    let v = GtkBox::new(Orientation::Vertical, 10);
+    v.set_margin_top(16);
+    v.set_margin_bottom(16);
+    v.set_margin_start(16);
+    v.set_margin_end(16);
+    v.append(body);
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_halign(gtk::Align::End);
+    let close = Button::with_label("Close");
+    close.add_css_class("suggested-action");
+    row.append(&close);
+    v.append(&row);
+    dlg.set_child(Some(&v));
+    let dlg_c = dlg.clone();
+    close.connect_clicked(move |_| dlg_c.close());
+    dlg.present();
+}
+
+fn show_properties(window: &ApplicationWindow, path: &Path) {
+    let meta = std::fs::symlink_metadata(path);
+    let title = format!("Properties — {}", path.file_name().unwrap_or_default().to_string_lossy());
     let v = GtkBox::new(Orientation::Vertical, 8);
-    v.set_margin_top(12);
-    v.set_margin_bottom(12);
-    v.set_margin_start(12);
-    v.set_margin_end(12);
 
     let add_row = |title: &str, value: &str, parent: &GtkBox| {
         let h = GtkBox::new(Orientation::Horizontal, 12);
@@ -3079,7 +3508,7 @@ fn show_properties(window: &ApplicationWindow, path: &Path) {
 
     add_row("Name:", &path.file_name().unwrap_or_default().to_string_lossy(), &v);
     add_row("Path:", &path.display().to_string(), &v);
-    add_row("Type:", &mime_guess::from_path(path).first_raw().unwrap_or("-"), &v);
+    add_row("Type:", mime_guess::from_path(path).first_raw().unwrap_or("-"), &v);
     if let Ok(m) = meta {
         add_row("Size:", &human_size(m.len()), &v);
         if let Ok(modified) = m.modified() {
@@ -3101,10 +3530,7 @@ fn show_properties(window: &ApplicationWindow, path: &Path) {
         }
     }
 
-    content.append(&v);
-    dialog.connect_response(|d, _| d.close());
-    dialog.present();
-    dialog.set_default_size(480, 360);
+    show_info(window, &title, &v.upcast());
 }
 
 fn show_properties_multi(window: &ApplicationWindow, paths: &[PathBuf]) {
@@ -3124,13 +3550,7 @@ fn show_properties_multi(window: &ApplicationWindow, paths: &[PathBuf]) {
             bytes_failed += 1;
         }
     }
-    let dialog = gtk::Dialog::builder()
-        .title(format!("Properties — {} items", paths.len()))
-        .transient_for(window)
-        .modal(true)
-        .build();
-    dialog.add_button("Close", gtk::ResponseType::Close);
-    let content = dialog.content_area();
+    let title = format!("Properties — {} items", paths.len());
     let v = GtkBox::new(Orientation::Vertical, 8);
     v.set_margin_top(12);
     v.set_margin_bottom(12);
@@ -3168,10 +3588,7 @@ fn show_properties_multi(window: &ApplicationWindow, paths: &[PathBuf]) {
         add_row("Unavailable:", &format!("{bytes_failed}"), &v);
     }
 
-    content.append(&v);
-    dialog.connect_response(|d, _| d.close());
-    dialog.present();
-    dialog.set_default_size(440, 300);
+    show_info(window, &title, &v.upcast());
 }
 
 fn show_error(window: &ApplicationWindow, msg: &str) {
