@@ -1,0 +1,31 @@
+[package]
+name = "sharkmanager"
+version = "0.1.0"
+edition = "2021"
+description = "SharkManager — Thunar-like file manager built with Rust + GTK4"
+authors = ["SharkManager Contributors"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/example/sharkmanager"
+keywords = ["gtk4", "file-manager", "thunar", "gtk", "rust"]
+categories = ["filesystem"]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+glib = "0.20"
+gio = { version = "0.20", features = ["v2_80"] }
+gdk4 = { package = "gdk4", version = "0.9" }
+cairo-rs = "0.20"
+pango = "0.20"
+graphene-rs = "0.20"
+gdk-pixbuf = "0.20"
+chrono = "0.4"
+mime_guess = "2.0"
+dirs = "5.0"
+trash = "5.1"
+open = "5.3"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
