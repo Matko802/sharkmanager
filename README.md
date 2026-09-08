@@ -30,13 +30,14 @@ SharkManager is a fast, lightweight, Thunar-inspired file manager for Linux, wri
 ### ⚡ Navigation
 - Full **history** (Back `Alt+Left`, Forward `Alt+Right`, Up `Alt+Up`, Home)
 - Double-click to open dirs/files
+- Single click selects; click an already-selected name again to rename inline (stem pre-selected, `Enter` commits, `Esc` cancels)
 - Path entry (`Ctrl+L`, `Escape` to cancel, `Enter` to navigate)
 - Selection tracking (FlowBox + ListBox multiple, status update)
 
 ### 🛠 File Operations
 - **New Folder** (`Ctrl+Shift+N` / header button) — dialog with duplicate check
 - **New File** (`Ctrl+N`)
-- **Rename** (`F2` / context menu) — with exists check
+- **Rename** (`F2` / slow second click / context menu) — with exists check
 - **Trash** (`Delete` / context menu) — via `trash` crate (moves to `~/.local/share/Trash`)
 - **Delete Permanently** (`Shift+Delete` / context menu) — warning dialog
 - **Cut / Copy / Paste** (`Ctrl+X/C/V` + context menu) — clipboard in-memory, `copy_recursive` for dirs, `unique_name` to avoid collisions

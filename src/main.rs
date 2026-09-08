@@ -56,6 +56,7 @@ struct AppState {
     monitor: RefCell<Option<gio::FileMonitor>>,
     monitored: RefCell<Option<PathBuf>>,
     rescan_pending: Cell<bool>,
+    rename_timer: RefCell<Option<glib::SourceId>>,
     thumb_gen: Cell<u64>,
     search_timer: RefCell<Option<glib::SourceId>>,
 }
@@ -76,6 +77,7 @@ impl AppState {
             monitor: RefCell::new(None),
             monitored: RefCell::new(None),
             rescan_pending: Cell::new(false),
+            rename_timer: RefCell::new(None),
             thumb_gen: Cell::new(0),
             search_timer: RefCell::new(None),
         }
@@ -1247,10 +1249,36 @@ fn build_pane(
                 let path = entry.path.clone();
                 let is_dir = entry.is_dir;
                 let refresh_cell2 = refresh_clone.clone();
+                let flow_c = flow.clone();
+                let list_c = list_box.clone();
+                let status_c = status_sel.clone();
+                let window_c = window.clone();
+                let drop_c = drop_refresh.clone();
+                let w_c = w.clone();
                 let gesture = GestureClick::new();
                 gesture.set_button(1);
                 gesture.connect_pressed(move |gest, n, _, _| {
-                    if n == 2 {
+                    if n == 1 {
+                        let was = state_c2.selected.borrow().contains(&path);
+                        click_select(&state_c2, &flow_c, &list_c, &status_c, &path);
+                        if was {
+                            let lbl = unsafe {
+                                w_c.data::<Label>("name_label").map(|g| g.as_ref().clone())
+                            };
+                            if let Some(lbl) = lbl {
+                                arm_inline_rename(
+                                    &state_c2,
+                                    &w_c,
+                                    &lbl,
+                                    path.clone(),
+                                    true,
+                                    &window_c,
+                                    drop_c.clone(),
+                                );
+                            }
+                        }
+                    } else if n == 2 {
+                        disarm_inline_rename(&state_c2);
                         if is_dir {
                             navigate_to(&state_c2, path.clone());
                             if let Some(f) = refresh_cell2.borrow().as_ref() {
@@ -1309,10 +1337,36 @@ fn build_pane(
                 let path = entry.path.clone();
                 let is_dir = entry.is_dir;
                 let refresh_cell2 = refresh_clone.clone();
+                let flow_c = flow.clone();
+                let list_c = list_box.clone();
+                let status_c = status_sel.clone();
+                let window_c = window.clone();
+                let drop_c = drop_refresh.clone();
+                let box_c = row_widget.clone();
                 let gesture = GestureClick::new();
                 gesture.set_button(1);
                 gesture.connect_pressed(move |gest, n, _, _| {
-                    if n == 2 {
+                    if n == 1 {
+                        let was = state_c2.selected.borrow().contains(&path);
+                        click_select(&state_c2, &flow_c, &list_c, &status_c, &path);
+                        if was {
+                            let lbl = unsafe {
+                                box_c.data::<Label>("name_label").map(|g| g.as_ref().clone())
+                            };
+                            if let Some(lbl) = lbl {
+                                arm_inline_rename(
+                                    &state_c2,
+                                    &box_c,
+                                    &lbl,
+                                    path.clone(),
+                                    false,
+                                    &window_c,
+                                    drop_c.clone(),
+                                );
+                            }
+                        }
+                    } else if n == 2 {
+                        disarm_inline_rename(&state_c2);
                         if is_dir {
                             navigate_to(&state_c2, path.clone());
                             if let Some(f) = refresh_cell2.borrow().as_ref() {
@@ -1776,6 +1830,9 @@ fn build_icon_tile(entry: &FileEntry, gen: u64) -> GtkBox {
         label.add_css_class("dim-label");
     }
     vbox.append(&label);
+    unsafe {
+        vbox.set_data("name_label", label.clone());
+    }
 
     vbox
 }
@@ -1860,6 +1917,9 @@ fn build_list_row(entry: &FileEntry) -> GtkBox {
         name_label.add_css_class("dim-label");
     }
     hbox.append(&name_label);
+    unsafe {
+        hbox.set_data("name_label", name_label.clone());
+    }
 
     let size_str = if entry.is_dir {
         "—".to_string()
@@ -3116,6 +3176,7 @@ fn wire_box_drag(
     }
 
     let state = state.clone();
+    let state_u = state.clone();
     let flow_c = flow.clone();
     let list_c = list_box.clone();
     let status_c = status_sel.clone();
@@ -3154,6 +3215,7 @@ fn wire_box_drag(
             if dx * dx + dy * dy <= 16.0 {
                 return;
             }
+            disarm_inline_rename(&state_u);
             (rect, db.ctrl, db.base.clone())
         };
         if let (Some(a), Some(b)) = (
@@ -3403,6 +3465,125 @@ fn prompt_rename(window: &ApplicationWindow, path: &Path, do_refresh: RefreshFn)
             }
         },
     );
+}
+
+fn click_select(
+    state: &Rc<AppState>,
+    flow: &FlowBox,
+    list_box: &ListBox,
+    status_sel: &Label,
+    path: &Path,
+) {
+    let mut set = HashSet::new();
+    set.insert(path.to_path_buf());
+    *state.selected.borrow_mut() = set.clone();
+    apply_selection(flow, list_box, status_sel, &set);
+}
+
+fn disarm_inline_rename(state: &Rc<AppState>) {
+    if let Some(id) = state.rename_timer.borrow_mut().take() {
+        id.remove();
+    }
+}
+
+fn arm_inline_rename(
+    state: &Rc<AppState>,
+    host: &GtkBox,
+    label: &Label,
+    path: PathBuf,
+    center: bool,
+    window: &ApplicationWindow,
+    refresh: RefreshFn,
+) {
+    disarm_inline_rename(state);
+    let weak_box = host.downgrade();
+    let weak_label = label.downgrade();
+    let st = state.clone();
+    let w = window.clone();
+    *state.rename_timer.borrow_mut() = Some(glib::timeout_add_local_once(
+        Duration::from_millis(600),
+        move || {
+            st.rename_timer.borrow_mut().take();
+            let (Some(b), Some(l)) = (weak_box.upgrade(), weak_label.upgrade()) else {
+                return;
+            };
+            inline_rename(&b, &l, &path, center, &w, refresh);
+        },
+    ));
+}
+
+fn inline_rename(
+    box_: &GtkBox,
+    label: &Label,
+    path: &Path,
+    center: bool,
+    window: &ApplicationWindow,
+    refresh: RefreshFn,
+) {
+    let anchor = label.prev_sibling();
+    box_.remove(label);
+    let entry = Entry::new();
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    entry.set_text(&name);
+    let stem = name
+        .rfind('.')
+        .filter(|&i| i > 0)
+        .map(|i| name[..i].chars().count() as i32)
+        .unwrap_or_else(|| name.chars().count() as i32);
+    entry.select_region(0, stem);
+    if center {
+        gtk::prelude::EntryExt::set_alignment(&entry, 0.5);
+        entry.set_width_chars(12);
+    } else {
+        entry.set_hexpand(true);
+    }
+    box_.insert_child_after(&entry, anchor.as_ref());
+    entry.grab_focus();
+    let done = Rc::new(Cell::new(false));
+    let commit = {
+        let done = done.clone();
+        let entry_c = entry.clone();
+        let path = path.to_path_buf();
+        let w = window.clone();
+        let refresh = refresh.clone();
+        move || {
+            if done.replace(true) {
+                return;
+            }
+            let new_name = entry_c.text().to_string();
+            let new_name = new_name.trim();
+            if !new_name.is_empty() && new_name != name {
+                let dst = path.parent().unwrap_or(Path::new("/")).join(new_name);
+                if dst.exists() {
+                    show_error(&w, "Destination already exists");
+                } else if let Err(e) = rename_path(&path, &dst) {
+                    show_error(&w, &format!("Rename failed: {e}"));
+                }
+            }
+            refresh();
+        }
+    };
+    let commit_activate = commit.clone();
+    entry.connect_activate(move |_| commit_activate());
+    let commit_leave = commit.clone();
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave(move |_| commit_leave());
+    entry.add_controller(focus);
+    let done_esc = done.clone();
+    let refresh_esc = refresh.clone();
+    let key = gtk::EventControllerKey::new();
+    key.connect_key_pressed(move |_, k, _, _| {
+        if k == gdk::Key::Escape {
+            done_esc.set(true);
+            refresh_esc();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    entry.add_controller(key);
 }
 
 fn describe_paths(paths: &[PathBuf]) -> String {
