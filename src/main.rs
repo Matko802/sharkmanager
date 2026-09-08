@@ -1945,8 +1945,7 @@ struct Bookmark {
 fn bookmark_files() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        out.push(home.join(".config/gtk-4.0/bookmarks"));
-        out.push(home.join(".config/gtk-3.0/bookmarks"));
+        out.push(home.join(".config/sharkmanager/bookmarks"));
     }
     out
 }
@@ -2041,7 +2040,7 @@ fn append_bookmark_rows(list: &ListBox) {
         h.set_margin_bottom(4);
         h.set_margin_start(8);
         h.set_margin_end(8);
-        let img = gtk::Image::from_icon_name("folder-bookmark-symbolic");
+        let img = gtk::Image::from_icon_name("folder");
         img.set_pixel_size(18);
         h.append(&img);
         row.set_child(Some(&h));

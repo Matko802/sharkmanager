@@ -13,7 +13,7 @@ SharkManager is a fast, lightweight, Thunar-inspired file manager for Linux, wri
 ## ✨ Features
 
 ### 📁 Thunar-like UX
-- **Sidebar** — Places (Home, Documents, Downloads, Pictures, Videos, Desktop, Music, Trash, File System), **Bookmarks** (icon-only, right-click to rename/remove/add; synced with `~/.config/gtk-3.0/bookmarks` and `gtk-4.0`), and **Devices** (auto-detected `/media`, `/mnt`, `/run/media`)
+- **Sidebar** — Places (Home, Documents, Downloads, Pictures, Videos, Desktop, Music, Trash, File System), **Bookmarks** (empty by default with plain folder icons like Nautilus; icon-only, right-click to rename/remove/add; stored in `~/.config/sharkmanager/bookmarks`), and **Devices** (auto-detected `/media`, `/mnt`, `/run/media`)
 - **Breadcrumbs** — clickable path bar in the header center (`/` → `home` → `matko` → …) with active segment highlight, plus **Ctrl+L** to edit raw path
 - **HeaderBar** — Nautilus-style: sidebar toggle, Back / Forward, centered search (toggle, `Ctrl+F`), view toggle, sort menu, new folder
 - **Status pill** — floating item/selection count overlay (Nautilus-style)
