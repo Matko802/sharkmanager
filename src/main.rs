@@ -1717,13 +1717,13 @@ fn request_thumb(entry: &FileEntry, img: &gtk::Image, size: i32, video: bool, ge
 }
 
 fn build_icon_tile(entry: &FileEntry, gen: u64) -> GtkBox {
-    const ICON_SIZE: i32 = 44;
-    const THUMB_SIZE: i32 = 56;
+    const ICON_SIZE: i32 = 64;
+    const THUMB_SIZE: i32 = 80;
 
     let vbox = GtkBox::new(Orientation::Vertical, 2);
     vbox.set_halign(gtk::Align::Center);
     vbox.set_valign(gtk::Align::Start);
-    vbox.set_width_request(86);
+    vbox.set_width_request(110);
     vbox.add_css_class("shark-tile");
 
     // Icon / preview
