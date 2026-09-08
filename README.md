@@ -13,10 +13,11 @@ SharkManager is a fast, lightweight, Thunar-inspired file manager for Linux, wri
 ## ✨ Features
 
 ### 📁 Thunar-like UX
-- **Sidebar** — Places (Home, Documents, Downloads, Pictures, Videos, Desktop, Music, Trash, File System), **Bookmarks** (parsed from `~/.config/gtk-3.0/bookmarks`), and **Devices** (auto-detected `/media`, `/mnt`, `/run/media`)
-- **Breadcrumbs** — clickable path bar (`/` → `home` → `matko` → …) with active segment highlight, plus **Ctrl+L** to edit raw path
-- **HeaderBar** — Back / Forward / Up / Home, show hidden toggle, view toggle, new folder, refresh, search
-- **Status Bar** — current path, item count, selection count
+- **Sidebar** — Places (Home, Documents, Downloads, Pictures, Videos, Desktop, Music, Trash, File System), **Bookmarks** (icon-only, right-click to rename/remove/add; synced with `~/.config/gtk-3.0/bookmarks` and `gtk-4.0`), and **Devices** (auto-detected `/media`, `/mnt`, `/run/media`)
+- **Breadcrumbs** — clickable path bar in the header center (`/` → `home` → `matko` → …) with active segment highlight, plus **Ctrl+L** to edit raw path
+- **HeaderBar** — Nautilus-style: sidebar toggle, Back / Forward, centered search (toggle, `Ctrl+F`), view toggle, sort menu, new folder
+- **Status pill** — floating item/selection count overlay (Nautilus-style)
+- **Tabs** — Nautilus-style `AdwTabBar`/`AdwTabView` strip under the header (drag-reorder, middle-click close, `Ctrl+T`/`Ctrl+W`)
 
 ### 🗂 Two View Modes
 - **Icon View** (`FlowBox`) — 48px icons, thumbnails for images via `gdk-pixbuf` (96px scaled), 2-line wrapped labels, hover/selection styling
@@ -64,7 +65,7 @@ SharkManager is a fast, lightweight, Thunar-inspired file manager for Linux, wri
 
 ## 🖥 Screenshots
 
-> Run the app to see: sidebar on left (210px), header bar, FlowBox icon grid or ListBox table, breadcrumbs, status bar.
+> Run the app to see: sidebar on left (210px), Nautilus-style header (search center) with tab strip below, FlowBox icon grid or ListBox table, floating status pill.
 
 ---
 
